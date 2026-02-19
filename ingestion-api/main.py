@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from utils import validate_payment_event
+from utils import validate_payment_event, verify_signature, get_hmac_secret
 import logging
 
 app = Flask(__name__)
@@ -11,6 +11,52 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+def validate_request(request_obj) -> tuple[bool, dict | None, int | None]:
+    """
+    Validate incoming request including JSON data, HMAC signature, and payment event data.
+    
+    Args:
+        request_obj: Flask request object
+        
+    Returns:
+        Tuple of (is_valid: bool, error_response: dict | None, status_code: int | None)
+        If valid, returns (True, None, None)
+        If invalid, returns (False, error_response_dict, status_code)
+    """
+    # Check if JSON data exists
+    data = request_obj.get_json()
+    if not data:
+        logger.warning('Received request with no JSON data')
+        return False, {'error': 'No JSON data provided'}, 400
+    
+    # Verify HMAC signature header exists
+    signature = request_obj.headers.get('X-HMAC-Signature')
+    if not signature:
+        logger.warning('Received request without HMAC signature')
+        return False, {'error': 'Forbidden'}, 403
+    
+    # Verify HMAC signature
+    try:
+        secret = get_hmac_secret()
+        if not verify_signature(data, signature, secret):
+            transaction_id = data.get('Transaction ID', 'unknown')
+            logger.warning(f'Invalid HMAC signature for transaction {transaction_id}')
+            return False, {'error': 'Forbidden'}, 403
+    except ValueError as e:
+        logger.error(f'HMAC secret configuration error: {str(e)}')
+        return False, {'error': 'Internal server error'}, 500
+    
+    # Validate payment event data
+    is_valid, error_message = validate_payment_event(data)
+    if not is_valid:
+        transaction_id = data.get('Transaction ID', 'unknown')
+        logger.warning(f'Validation failed for transaction {transaction_id}: {error_message}')
+        return False, {'error': error_message}, 400
+    
+    # All validations passed
+    return True, None, None
 
 
 @app.route('/events', methods=['POST'])
@@ -31,18 +77,13 @@ def receive_payment_event():
     }
     """
     try:
-        data = request.get_json()
-        
-        if not data:
-            logger.warning('Received request with no JSON data')
-            return jsonify({'error': 'No JSON data provided'}), 400
-        
-        # Validate payment event data
-        is_valid, error_message = validate_payment_event(data)
+        # Validate request (JSON data, HMAC signature, payment event data)
+        is_valid, error_response, status_code = validate_request(request)
         if not is_valid:
-            transaction_id = data.get('Transaction ID', 'unknown')
-            logger.warning(f'Validation failed for transaction {transaction_id}: {error_message}')
-            return jsonify({'error': error_message}), 400
+            return jsonify(error_response), status_code
+        
+        # Get validated data
+        data = request.get_json()
         
         # Log payment event at info level
         transaction_id = data['Transaction ID']
@@ -62,7 +103,7 @@ def receive_payment_event():
             f'Timestamp: {timestamp}'
         )
         
-        # If all validations pass, return success response
+        # Return success response
         return jsonify({
             'message': 'Payment event received successfully',
             'transaction_id': data['Transaction ID']

@@ -1,5 +1,17 @@
 from datetime import datetime
 import re
+import hmac
+import hashlib
+import json
+import os
+import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 def validate_transaction_id(transaction_id: str) -> bool:
@@ -89,3 +101,80 @@ def validate_payment_event(data: dict) -> tuple[bool, str | None]:
     
     # All validations passed
     return True, None
+
+
+def get_hmac_secret() -> str:
+    """
+    Get HMAC secret from environment variable.
+    
+    Returns:
+        HMAC secret key as string
+        
+    Raises:
+        ValueError: If HMAC_SECRET is not set in environment
+    """
+    secret = os.getenv('HMAC_SECRET')
+    if not secret:
+        raise ValueError('HMAC_SECRET environment variable is not set')
+    return secret
+
+
+def generate_signature(payload: dict, secret: str) -> str:
+    """
+    Generate HMAC-SHA256 signature for a payload.
+    
+    Args:
+        payload: Dictionary containing the request payload
+        secret: Secret key for HMAC
+        
+    Returns:
+        Hexadecimal signature string
+    """
+    transaction_id = payload.get('Transaction ID', 'unknown')
+    
+    try:
+        # Convert payload to JSON string and encode to bytes
+        payload_str = json.dumps(payload, sort_keys=True)
+        payload_bytes = payload_str.encode('utf-8')
+        secret_bytes = secret.encode('utf-8')
+        
+        # Generate HMAC-SHA256 signature
+        signature = hmac.new(
+            secret_bytes,
+            payload_bytes,
+            hashlib.sha256
+        ).hexdigest()
+        
+        return signature
+    except Exception as e:
+        raise e
+
+
+def verify_signature(payload: dict, signature: str, secret: str) -> bool:
+    """
+    Verify HMAC-SHA256 signature for a payload.
+    
+    Args:
+        payload: Dictionary containing the request payload
+        signature: Signature string to verify
+        secret: Secret key for HMAC
+        
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    transaction_id = payload.get('Transaction ID', 'unknown')
+    
+    try:
+        expected_signature = generate_signature(payload, secret)
+        # Use constant-time comparison to prevent timing attacks
+        is_valid = hmac.compare_digest(expected_signature, signature)
+        
+        if is_valid:
+            logger.debug(f'HMAC signature verified successfully for transaction: {transaction_id}')
+        else:
+            logger.warning(f'HMAC signature verification failed for transaction: {transaction_id}')
+        
+        return is_valid
+    except Exception as e:
+        logger.error(f'Error verifying HMAC signature for transaction {transaction_id}: {str(e)}')
+        return False

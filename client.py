@@ -9,8 +9,15 @@ import json
 import time
 import argparse
 import sys
+import os
 from typing import Dict, Any
 import requests
+import hmac
+import hashlib
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 def read_transactions_csv_chunks(file_path: str, chunk_size: int = 10):
@@ -57,22 +64,64 @@ def read_transactions_csv_chunks(file_path: str, chunk_size: int = 10):
         sys.exit(1)
 
 
-def send_payment_event(api_url: str, transaction: Dict[str, Any]) -> tuple[bool, str]:
+def generate_hmac_signature(payload: dict, secret: str) -> str:
     """
-    Send a payment event to the Flask API.
+    Generate HMAC-SHA256 signature for a payload.
+    
+    Args:
+        payload: Dictionary containing the request payload
+        secret: Secret key for HMAC
+        
+    Returns:
+        Hexadecimal signature string
+    """
+    # Convert payload to JSON string and encode to bytes
+    payload_str = json.dumps(payload, sort_keys=True)
+    payload_bytes = payload_str.encode('utf-8')
+    secret_bytes = secret.encode('utf-8')
+    
+    # Generate HMAC-SHA256 signature
+    signature = hmac.new(
+        secret_bytes,
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return signature
+
+
+def send_payment_event(api_url: str, transaction: Dict[str, Any], hmac_secret: str = None) -> tuple[bool, str]:
+    """
+    Send a payment event to the Flask API with HMAC signature.
     
     Args:
         api_url: Base URL of the Flask API
         transaction: Transaction data dictionary
+        hmac_secret: HMAC secret key (if None, reads from HMAC_SECRET env var)
         
     Returns:
         Tuple of (success: bool, message: str)
     """
     try:
+        # Get HMAC secret
+        if hmac_secret is None:
+            hmac_secret = os.getenv('HMAC_SECRET')
+            if not hmac_secret:
+                return False, "Error: HMAC_SECRET environment variable is not set"
+        
+        # Generate HMAC signature
+        signature = generate_hmac_signature(transaction, hmac_secret)
+        
+        # Prepare headers with signature
+        headers = {
+            'Content-Type': 'application/json',
+            'X-HMAC-Signature': signature
+        }
+        
         response = requests.post(
             f"{api_url}/events",
             json=transaction,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
             timeout=10
         )
         
@@ -96,7 +145,8 @@ def simulate_traffic(
     delay: float = 0.1,
     max_transactions: int = None,
     start_from: int = 0,
-    chunk_size: int = 10
+    chunk_size: int = 10,
+    hmac_secret: str = None
 ):
     """
     Simulate real-time traffic by reading CSV in chunks and sending POST requests.
@@ -146,7 +196,7 @@ def simulate_traffic(
     # Process first chunk if it was adjusted
     if first_chunk:
         chunk = first_chunk
-        
+
         for transaction in chunk:
             # Check if we've reached max_transactions limit
             if max_transactions and transaction_counter >= max_transactions:
@@ -158,7 +208,7 @@ def simulate_traffic(
             
             print(f"  [{transaction_counter}] Sending transaction: {transaction_id[:8]}...", end=" ")
             
-            success, message = send_payment_event(api_url, transaction)
+            success, message = send_payment_event(api_url, transaction, hmac_secret)
             
             if success:
                 success_count += 1
@@ -199,7 +249,7 @@ def simulate_traffic(
             
             print(f"  [{transaction_counter}] Sending transaction: {transaction_id[:8]}...", end=" ")
             
-            success, message = send_payment_event(api_url, transaction)
+            success, message = send_payment_event(api_url, transaction, hmac_secret)
             
             if success:
                 success_count += 1
@@ -266,8 +316,20 @@ def main():
         default=10,
         help='Number of transactions to read per chunk (default: 10)'
     )
+    parser.add_argument(
+        '--hmac-secret',
+        type=str,
+        default=None,
+        help='HMAC secret key (default: reads from HMAC_SECRET env var)'
+    )
     
     args = parser.parse_args()
+    
+    # Get HMAC secret from args or environment
+    hmac_secret = args.hmac_secret or os.getenv('HMAC_SECRET')
+    if not hmac_secret:
+        print("Warning: HMAC_SECRET not set. Requests will fail signature verification.")
+        print("Set HMAC_SECRET environment variable or use --hmac-secret option.")
     
     simulate_traffic(
         csv_file=args.csv,
@@ -275,8 +337,9 @@ def main():
         delay=args.delay,
         max_transactions=args.max,
         start_from=args.start_from,
-        chunk_size=args.chunk_size
-    )
+        chunk_size=args.chunk_size,
+        hmac_secret=hmac_secret
+    )   
 
 
 if __name__ == "__main__":
