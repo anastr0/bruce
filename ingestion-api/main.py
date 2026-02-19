@@ -1,6 +1,13 @@
 from flask import Flask, request, jsonify
-from utils import validate_payment_event, verify_signature, get_hmac_secret
+from utils import (
+    validate_payment_event,
+    verify_signature,
+    get_hmac_secret,
+    send_payment_event_to_kafka,
+    is_producer_available,
+)
 import logging
+import os
 
 app = Flask(__name__)
 
@@ -103,6 +110,21 @@ def receive_payment_event():
             f'Timestamp: {timestamp}'
         )
         
+        # Send payment event to Kafka
+        kafka_topic = os.getenv('KAFKA_TOPIC', 'payment-events')
+        kafka_success = send_payment_event_to_kafka(
+            topic=kafka_topic,
+            payment_event=data,
+            transaction_id=transaction_id
+        )
+        
+        if not kafka_success:
+            logger.error(f'Failed to send payment event to Kafka for transaction {transaction_id}')
+            return jsonify({
+                'error': 'Internal server error',
+                'message': 'Internal server error'
+            }), 500
+        
         # Return success response
         return jsonify({
             'message': 'Payment event received successfully',
@@ -115,6 +137,22 @@ def receive_payment_event():
             'error': 'Internal server error',
             'message': str(e)
         }), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    Health check endpoint to verify API and Kafka connectivity.
+    """
+    kafka_available = is_producer_available()
+    
+    status = {
+        'status': 'healthy' if kafka_available else 'degraded',
+        'kafka': 'connected' if kafka_available else 'disconnected'
+    }
+    
+    status_code = 200 if kafka_available else 503
+    return jsonify(status), status_code
 
 
 def main():

@@ -10,6 +10,9 @@ services:
       replicas: 3
     environment:
       - HMAC_SECRET=${HMAC_SECRET:-your-secret-key-here-change-this-in-production}
+      # Override KAFKA_BOOTSTRAP_SERVERS for Docker network (use internal Docker service names)
+      - KAFKA_BOOTSTRAP_SERVERS=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-payment-events}
     env_file:
       - .env
     volumes:
@@ -44,6 +47,143 @@ services:
       retries: 3
       start_period: 10s
 
+  kafka-1:
+    image: apache/kafka:3.7.0
+    container_name: bruce-kafka-1
+    environment:
+      # KRaft mode configuration
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Cluster configuration
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      # Log directories
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    command: >
+      sh -c "
+      mkdir -p /var/lib/kafka/data &&
+      chmod -R 777 /var/lib/kafka/data &&
+      if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+        /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /opt/kafka/config/kraft/server.properties --ignore-formatted;
+      fi &&
+      /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties
+      "
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    restart: unless-stopped
+    networks:
+      - bruce-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  kafka-2:
+    image: apache/kafka:3.7.0
+    container_name: bruce-kafka-2
+    environment:
+      # KRaft mode configuration
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 2
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:19093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Cluster configuration
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      # Log directories
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    command: >
+      sh -c "
+      mkdir -p /var/lib/kafka/data &&
+      chmod -R 777 /var/lib/kafka/data &&
+      if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+        /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /opt/kafka/config/kraft/server.properties --ignore-formatted;
+      fi &&
+      /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties
+      "
+    ports:
+      - "9093:9092"
+      - "19093:19093"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    restart: unless-stopped
+    networks:
+      - bruce-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  kafka-3:
+    image: apache/kafka:3.7.0
+    container_name: bruce-kafka-3
+    environment:
+      # KRaft mode configuration
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 3
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:19094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Cluster configuration
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      # Log directories
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    command: >
+      sh -c "
+      mkdir -p /var/lib/kafka/data &&
+      chmod -R 777 /var/lib/kafka/data &&
+      if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+        /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /opt/kafka/config/kraft/server.properties --ignore-formatted;
+      fi &&
+      /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/kraft/server.properties
+      "
+    ports:
+      - "9094:9092"
+      - "19094:19094"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+    restart: unless-stopped
+    networks:
+      - bruce-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 networks:
   bruce-network:
     driver: bridge
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:

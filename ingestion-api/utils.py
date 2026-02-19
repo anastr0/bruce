@@ -5,7 +5,11 @@ import hashlib
 import json
 import os
 import logging
+import atexit
+from typing import Optional
 from dotenv import load_dotenv
+from kafka import KafkaProducer
+from kafka.errors import KafkaError, KafkaTimeoutError, LeaderNotAvailableError
 
 # Load environment variables
 load_dotenv()
@@ -177,4 +181,181 @@ def verify_signature(payload: dict, signature: str, secret: str) -> bool:
         return is_valid
     except Exception as e:
         logger.error(f'Error verifying HMAC signature for transaction {transaction_id}: {str(e)}')
+        return False
+
+
+# ============================================================================
+# Kafka Producer Utilities
+# ============================================================================
+
+def get_kafka_brokers() -> str:
+    """
+    Get Kafka broker addresses from environment variable or use default.
+    
+    Returns:
+        Comma-separated string of Kafka broker addresses
+    """
+    brokers = os.getenv(
+        'KAFKA_BOOTSTRAP_SERVERS',
+        'kafka-1:9092,kafka-2:9092,kafka-3:9092'
+    )
+    return brokers
+
+
+# Global producer instance (created on first use)
+_producer: Optional[KafkaProducer] = None
+
+
+def create_kafka_producer() -> KafkaProducer:
+    """
+    Create and configure a Kafka producer with acks=all for high durability.
+    Configured to work with KRaft-based Kafka cluster.
+    
+    Returns:
+        Configured KafkaProducer instance
+        
+    Raises:
+        Exception: If producer creation fails
+    """
+    brokers = get_kafka_brokers()
+    broker_list = [broker.strip() for broker in brokers.split(',')]
+    
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=broker_list,
+            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+            key_serializer=lambda k: k.encode('utf-8') if k else None,
+            acks='all',  # Wait for acknowledgment from all in-sync replicas (all brokers)
+            retries=5,  # Retry up to 5 times on failure
+            # max_in_flight_requests_per_connection=1,  # Ensure ordering
+            # enable_idempotence=True,  # Prevent duplicate messages
+            # compression_type='snappy',  # Compress messages for efficiency
+            # request_timeout_ms=30000,  # 30 second timeout
+            # delivery_timeout_ms=120000,  # 2 minute delivery timeout
+            # api_version=(0, 10, 1),  # Use compatible API version
+            metadata_max_age_ms=300000,  # Refresh metadata every 5 minutes
+        )
+        
+        logger.info(f'Kafka producer created successfully with brokers: {broker_list}')
+        
+        # Register cleanup function to close producer on exit
+        atexit.register(close_producer)
+        
+        return producer
+        
+    except Exception as e:
+        logger.error(f'Failed to create Kafka producer: {str(e)}', exc_info=True)
+        raise
+
+
+def get_producer() -> KafkaProducer:
+    """
+    Get or create the global Kafka producer instance.
+    
+    Returns:
+        KafkaProducer instance
+    """
+    global _producer
+    if _producer is None:
+        _producer = create_kafka_producer()
+    return _producer
+
+
+def send_payment_event_to_kafka(
+    topic: str,
+    payment_event: dict,
+    transaction_id: Optional[str] = None
+) -> bool:
+    """
+    Send a payment event to Kafka topic with acks=all configuration.
+    Ensures message is acknowledged by all in-sync replicas before returning success.
+    
+    Args:
+        topic: Kafka topic name
+        payment_event: Payment event dictionary to send
+        transaction_id: Optional transaction ID to use as message key
+        
+    Returns:
+        True if message was sent successfully and acknowledged by all brokers, False otherwise
+    """
+    try:
+        producer = get_producer()
+        
+        # Use transaction ID as key for partitioning (ensures same transaction goes to same partition)
+        key = transaction_id or payment_event.get('Transaction ID')
+        
+        if not key:
+            logger.warning('No transaction ID found in payment event, using None as key')
+        
+        # Send message to Kafka
+        # With acks='all', this will wait for acknowledgment from all in-sync replicas
+        future = producer.send(topic, value=payment_event, key=key)
+        
+        # Wait for the message to be acknowledged by all brokers (acks=all)
+        # This ensures the message is replicated to all brokers before returning
+        record_metadata = future.get(timeout=30)
+        
+        logger.info(
+            f'Payment event sent to Kafka successfully - '
+            f'Topic: {record_metadata.topic}, '
+            f'Partition: {record_metadata.partition}, '
+            f'Offset: {record_metadata.offset}, '
+            f'Transaction ID: {key}, '
+            f'Acknowledged by all brokers (acks=all)'
+        )
+        
+        return True
+        
+    except LeaderNotAvailableError as e:
+        logger.error(
+            f'Kafka leader not available for topic {topic}. '
+            f'This may indicate the topic does not exist or cluster is initializing. Error: {str(e)}'
+        )
+        return False
+    except KafkaTimeoutError as e:
+        logger.error(
+            f'Timeout waiting for Kafka acknowledgment (acks=all). '
+            f'Message may not have been replicated to all brokers. Error: {str(e)}'
+        )
+        return False
+    except KafkaError as e:
+        logger.error(f'Kafka error sending payment event: {str(e)}', exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f'Unexpected error sending payment event to Kafka: {str(e)}', exc_info=True)
+        return False
+
+
+def close_producer():
+    """
+    Close the Kafka producer and flush any pending messages.
+    This ensures all messages are sent before shutdown.
+    """
+    global _producer
+    if _producer is not None:
+        try:
+            logger.info('Flushing pending Kafka messages...')
+            _producer.flush(timeout=30)  # Wait up to 30 seconds for pending messages
+            _producer.close(timeout=10)
+            logger.info('Kafka producer closed successfully')
+        except Exception as e:
+            logger.error(f'Error closing Kafka producer: {str(e)}', exc_info=True)
+        finally:
+            _producer = None
+
+
+def is_producer_available() -> bool:
+    """
+    Check if Kafka producer is available and can connect to brokers.
+    
+    Returns:
+        True if producer is available, False otherwise
+    """
+    try:
+        producer = get_producer()
+        # Try to get cluster metadata to verify connection
+        producer.list_topics(timeout=5)
+        return True
+    except Exception as e:
+        logger.warning(f'Kafka producer not available: {str(e)}')
         return False
