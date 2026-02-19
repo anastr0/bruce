@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  flask-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bruce-flask-api
+    ports:
+      - "5000:5000"
+    environment:
+      - HMAC_SECRET=${HMAC_SECRET:-your-secret-key-here-change-this-in-production}
+    env_file:
+      - .env
+    volumes:
+      # Mount code for development (optional - remove in production)
+      - ./ingestion-api:/app/ingestion-api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.connect(('localhost', 5000)); s.close()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
