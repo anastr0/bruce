@@ -5,9 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: bruce-flask-api
-    ports:
-      - "5000:5000"
+    # Remove container_name to allow multiple instances
+    deploy:
+      replicas: 3
     environment:
       - HMAC_SECRET=${HMAC_SECRET:-your-secret-key-here-change-this-in-production}
     env_file:
@@ -22,3 +22,28 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - bruce-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: bruce-nginx
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - flask-api
+    restart: unless-stopped
+    networks:
+      - bruce-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /var/run/nginx.pid && kill -0 $(cat /var/run/nginx.pid)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  bruce-network:
+    driver: bridge
