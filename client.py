@@ -13,21 +13,22 @@ from typing import Dict, Any
 import requests
 
 
-def read_transactions_csv(file_path: str) -> list[Dict[str, Any]]:
+def read_transactions_csv_chunks(file_path: str, chunk_size: int = 10):
     """
-    Read transactions from CSV file and convert to list of dictionaries.
+    Generator that reads transactions from CSV file in chunks.
     
     Args:
         file_path: Path to the transactions CSV file
+        chunk_size: Number of transactions to read per chunk (default: 10)
         
-    Returns:
-        List of transaction dictionaries
+    Yields:
+        List of transaction dictionaries (chunk of transactions)
     """
-    transactions = []
-    
     try:
         with open(file_path, 'r', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
+            chunk = []
+            
             for row in reader:
                 # Convert Amount (INR) to float
                 transaction = dict(row)
@@ -37,9 +38,16 @@ def read_transactions_csv(file_path: str) -> list[Dict[str, Any]]:
                     print(f"Warning: Invalid amount for transaction {transaction.get('Transaction ID', 'unknown')}")
                     continue
                 
-                transactions.append(transaction)
-        
-        return transactions
+                chunk.append(transaction)
+                
+                # Yield chunk when it reaches the desired size
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+            
+            # Yield remaining transactions if any
+            if chunk:
+                yield chunk
     
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
@@ -87,10 +95,11 @@ def simulate_traffic(
     api_url: str = "http://localhost:5000",
     delay: float = 0.1,
     max_transactions: int = None,
-    start_from: int = 0
+    start_from: int = 0,
+    chunk_size: int = 10
 ):
     """
-    Simulate real-time traffic by reading CSV and sending POST requests.
+    Simulate real-time traffic by reading CSV in chunks and sending POST requests.
     
     Args:
         csv_file: Path to transactions CSV file
@@ -98,52 +107,125 @@ def simulate_traffic(
         delay: Delay in seconds between requests (default: 0.1s)
         max_transactions: Maximum number of transactions to send (None for all)
         start_from: Index to start from (for resuming)
+        chunk_size: Number of transactions to read per chunk (default: 10)
     """
-    print(f"Reading transactions from {csv_file}...")
-    transactions = read_transactions_csv(csv_file)
-    
-    total_transactions = len(transactions)
-    print(f"Found {total_transactions} transactions")
-    
-    if start_from > 0:
-        transactions = transactions[start_from:]
-        print(f"Starting from transaction {start_from + 1}")
-    
-    if max_transactions:
-        transactions = transactions[:max_transactions]
-        print(f"Limiting to {max_transactions} transactions")
-    
-    print(f"\nSending {len(transactions)} transactions to {api_url}/events")
+    print(f"Reading transactions from {csv_file} in chunks of {chunk_size}...")
+    print(f"Sending requests to {api_url}/events")
     print(f"Delay between requests: {delay}s\n")
     print("-" * 80)
     
     success_count = 0
     failure_count = 0
+    total_processed = 0
+    transaction_counter = 0
     
-    for idx, transaction in enumerate(transactions, start=1):
-        transaction_id = transaction.get('Transaction ID', 'unknown')
+    # Create generator for reading chunks
+    chunk_generator = read_transactions_csv_chunks(csv_file, chunk_size=chunk_size)
+    
+    # Skip chunks until we reach start_from
+    skipped = 0
+    first_chunk = None
+    first_chunk_num = 1
+    
+    if start_from > 0:
+        print(f"Skipping to transaction {start_from + 1}...")
+        for chunk in chunk_generator:
+            if skipped + len(chunk) <= start_from:
+                skipped += len(chunk)
+                first_chunk_num += 1
+                continue
+            else:
+                # Adjust chunk to start from the right position
+                offset = start_from - skipped
+                first_chunk = chunk[offset:]
+                break
+    
+    # Process chunks
+    chunk_num = first_chunk_num
+    
+    # Process first chunk if it was adjusted
+    if first_chunk:
+        chunk = first_chunk
         
-        print(f"[{idx}/{len(transactions)}] Sending transaction: {transaction_id[:8]}...", end=" ")
-        
-        success, message = send_payment_event(api_url, transaction)
-        
-        if success:
-            success_count += 1
-            print(f"✓ {message}")
-        else:
-            failure_count += 1
-            print(f"✗ {message}")
-        
-        # Add delay between requests (except for the last one)
-        if idx < len(transactions):
+        for transaction in chunk:
+            # Check if we've reached max_transactions limit
+            if max_transactions and transaction_counter >= max_transactions:
+                print(f"\nReached maximum transaction limit ({max_transactions})")
+                break
+            
+            transaction_counter += 1
+            transaction_id = transaction.get('Transaction ID', 'unknown')
+            
+            print(f"  [{transaction_counter}] Sending transaction: {transaction_id[:8]}...", end=" ")
+            
+            success, message = send_payment_event(api_url, transaction)
+            
+            if success:
+                success_count += 1
+                print(f"✓ {message}")
+            else:
+                failure_count += 1
+                print(f"✗ {message}")
+            
+            total_processed += 1
+            
+            # Add delay between requests
             time.sleep(delay)
+        
+        print(f"  Chunk {chunk_num} completed. Total processed: {total_processed}")
+        chunk_num += 1
+        
+        # Break if we've reached max_transactions
+        if max_transactions and transaction_counter >= max_transactions:
+            chunk_generator = iter([])  # Empty iterator to stop processing
+    
+    # Process remaining chunks from generator
+    for chunk in chunk_generator:
+        # Break if we've reached max_transactions
+        if max_transactions and transaction_counter >= max_transactions:
+            print(f"\nReached maximum transaction limit ({max_transactions})")
+            break
+        
+        print(f"\n[Chunk {chunk_num}] Processing {len(chunk)} transactions...")
+        
+        for transaction in chunk:
+            # Check if we've reached max_transactions limit
+            if max_transactions and transaction_counter >= max_transactions:
+                print(f"\nReached maximum transaction limit ({max_transactions})")
+                break
+            
+            transaction_counter += 1
+            transaction_id = transaction.get('Transaction ID', 'unknown')
+            
+            print(f"  [{transaction_counter}] Sending transaction: {transaction_id[:8]}...", end=" ")
+            
+            success, message = send_payment_event(api_url, transaction)
+            
+            if success:
+                success_count += 1
+                print(f"✓ {message}")
+            else:
+                failure_count += 1
+                print(f"✗ {message}")
+            
+            total_processed += 1
+            
+            # Add delay between requests
+            time.sleep(delay)
+        
+        print(f"  Chunk {chunk_num} completed. Total processed: {total_processed}")
+        chunk_num += 1
+        
+        # Break if we've reached max_transactions
+        if max_transactions and transaction_counter >= max_transactions:
+            break
     
     print("-" * 80)
     print(f"\nSummary:")
-    print(f"  Total sent: {len(transactions)}")
+    print(f"  Total sent: {total_processed}")
     print(f"  Successful: {success_count}")
     print(f"  Failed: {failure_count}")
-    print(f"  Success rate: {(success_count/len(transactions)*100):.1f}%" if transactions else "N/A")
+    print(f"  Success rate: {(success_count/total_processed*100):.1f}%" if total_processed > 0 else "N/A")
 
 
 def main():
@@ -178,6 +260,12 @@ def main():
         default=0,
         help='Index to start from (for resuming, default: 0)'
     )
+    parser.add_argument(
+        '--chunk-size',
+        type=int,
+        default=10,
+        help='Number of transactions to read per chunk (default: 10)'
+    )
     
     args = parser.parse_args()
     
@@ -186,7 +274,8 @@ def main():
         api_url=args.url,
         delay=args.delay,
         max_transactions=args.max,
-        start_from=args.start_from
+        start_from=args.start_from,
+        chunk_size=args.chunk_size
     )
 
 
