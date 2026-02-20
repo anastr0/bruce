@@ -31,18 +31,18 @@ logger = logging.getLogger(__name__)
 
 # Defaults (override via env)
 DEFAULT_TOPIC = "payment-webhooks"
-DEFAULT_DLQ_TOPIC = "payment-webhooks-dlq"
 DEFAULT_GROUP_ID = "webhook-dispatcher"
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 RETRY_BACKOFF_SEC = 2
 REQUEST_TIMEOUT_SEC = 3
+RETRY_DELAY_MINUTES = 5  # Wait 5 minutes before retrying after max retries exhausted
 
 _shutdown = False
 _producer: Optional[KafkaProducer] = None
 
 
 def _get_producer(bootstrap_servers: list[str]) -> KafkaProducer:
-    """Get or create Kafka producer for sending messages to DLQ."""
+    """Get or create Kafka producer for re-queuing messages."""
     global _producer
     if _producer is None:
         _producer = KafkaProducer(
@@ -56,31 +56,22 @@ def _get_producer(bootstrap_servers: list[str]) -> KafkaProducer:
     return _producer
 
 
-def _send_to_dlq(
+def _requeue_webhook(
     producer: KafkaProducer,
-    dlq_topic: str,
+    topic: str,
     payload: dict,
-    original_attempts: int,
 ) -> None:
-    """Send failed webhook to dead letter queue with metadata."""
-    dlq_message = {
-        "payload": payload,
-        "metadata": {
-            "failed_at": time.time(),
-            "original_attempts": original_attempts,
-            "transaction_id": payload.get("Transaction ID", "?"),
-        },
-    }
+    """Re-queue failed webhook back to Kafka topic."""
     try:
-        future = producer.send(dlq_topic, value=dlq_message)
+        future = producer.send(topic, value=payload)
         future.get(timeout=10)  # Wait for send to complete
         logger.info(
-            "Sent failed webhook to DLQ tid=%s attempts=%d",
+            "Re-queued failed webhook to Kafka tid=%s topic=%s",
             payload.get("Transaction ID", "?"),
-            original_attempts,
+            topic,
         )
     except Exception as e:
-        logger.error("Failed to send message to DLQ: %s", e)
+        logger.error("Failed to re-queue message to Kafka: %s", e)
 
 
 def _generate_signature(payload: dict, secret: str) -> str:
@@ -119,6 +110,7 @@ def _deliver_to_webhook(webhook_url: str, payload: dict, hmac_secret: str) -> bo
         )
         return True
     except requests.RequestException as e:
+        logger.error("Webhook delivery failed: %s", e)
         return False
 
 
@@ -126,7 +118,7 @@ def _consume_and_deliver(
     consumer: KafkaConsumer,
     webhook_url: str,
     hmac_secret: str,
-    dlq_topic: str,
+    topic: str,
     producer: KafkaProducer,
 ) -> None:
     global _shutdown
@@ -154,9 +146,10 @@ def _consume_and_deliver(
                 )
                 break
             if attempt < MAX_RETRIES:
-                backoff_delay = RETRY_BACKOFF_SEC * attempt
+                # Binary exponential backoff: base * 2^(attempt-1)
+                backoff_delay = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
                 logger.info(
-                    "Retrying webhook delivery tid=%s attempt=%d/%d after %.1fs backoff",
+                    "Retrying webhook delivery tid=%s attempt=%d/%d after %.1fs backoff (exponential)",
                     transaction_id,
                     attempt + 1,
                     MAX_RETRIES,
@@ -166,12 +159,61 @@ def _consume_and_deliver(
         
         if not delivered:
             logger.error(
-                "✗ WEBHOOK DELIVERY FAILED PERMANENTLY tid=%s url=%s attempts=%d - SENDING TO DLQ",
+                "✗ WEBHOOK DELIVERY FAILED PERMANENTLY tid=%s url=%s attempts=%d - RE-QUEUING AND PAUSING CONSUMER",
                 transaction_id,
                 webhook_url,
                 MAX_RETRIES,
             )
-            _send_to_dlq(producer, dlq_topic, payload, MAX_RETRIES)
+            
+            # Re-queue the failed webhook back to Kafka
+            _requeue_webhook(producer, topic, payload)
+            
+            # Pause consumer to stop processing new messages
+            try:
+                # Get all assigned partitions and pause them
+                # Note: assignment() returns the partitions assigned to this consumer
+                partitions = list(consumer.assignment())
+                if partitions:
+                    consumer.pause(*partitions)
+                    logger.info(
+                        "Consumer paused (%d partitions). Waiting %d minutes before resuming. tid=%s",
+                        len(partitions),
+                        RETRY_DELAY_MINUTES,
+                        transaction_id,
+                    )
+                    
+                    # Wait for the specified delay (checking for shutdown periodically)
+                    # delay_seconds = RETRY_DELAY_MINUTES * 60
+                    delay_seconds = 10
+                    elapsed = 0
+                    check_interval = 10  # Check every 10 seconds
+                    while elapsed < delay_seconds and not _shutdown:
+                        sleep_time = min(check_interval, delay_seconds - elapsed)
+                        time.sleep(sleep_time)
+                        elapsed += sleep_time
+                    
+                    if not _shutdown:
+                        # Resume consumer
+                        consumer.resume(*partitions)
+                        logger.info(
+                            "Consumer resumed after %d minute delay. tid=%s",
+                            RETRY_DELAY_MINUTES,
+                            transaction_id,
+                        )
+                    else:
+                        logger.info("Shutdown requested during pause, resuming consumer before exit")
+                        consumer.resume(*partitions)
+                else:
+                    logger.warning("No partitions assigned to consumer, cannot pause/resume")
+            except Exception as e:
+                logger.error("Error pausing/resuming consumer: %s", e)
+                # Try to resume if pause succeeded but resume failed
+                try:
+                    partitions = list(consumer.assignment())
+                    if partitions:
+                        consumer.resume(*partitions)
+                except Exception:
+                    pass
 
 
 def main() -> None:
@@ -180,7 +222,6 @@ def main() -> None:
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     bootstrap_list = [b.strip() for b in bootstrap.split(",") if b.strip()]
     topic = os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
-    dlq_topic = os.getenv("KAFKA_DLQ_TOPIC", DEFAULT_DLQ_TOPIC)
     group_id = os.getenv("KAFKA_CONSUMER_GROUP", DEFAULT_GROUP_ID)
     webhook_url = os.getenv("WEBHOOK_URL")
     hmac_secret = os.getenv("HMAC_SECRET")
@@ -200,15 +241,15 @@ def main() -> None:
     signal.signal(signal.SIGINT, on_signal)
 
     logger.info(
-        "Starting worker bootstrap=%s topic=%s dlq_topic=%s group=%s webhook=%s",
+        "Starting worker bootstrap=%s topic=%s group=%s webhook=%s retry_delay_minutes=%d",
         bootstrap,
         topic,
-        dlq_topic,
         group_id,
         webhook_url,
+        RETRY_DELAY_MINUTES,
     )
 
-    # Initialize producer for DLQ
+    # Initialize producer for re-queuing messages
     try:
         producer = _get_producer(bootstrap_list)
     except Exception as e:
@@ -229,7 +270,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        _consume_and_deliver(consumer, webhook_url, hmac_secret, dlq_topic, producer)
+        _consume_and_deliver(consumer, webhook_url, hmac_secret, topic, producer)
     finally:
         consumer.close()
         if _producer:
