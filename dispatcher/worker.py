@@ -198,8 +198,8 @@ def _consume_and_deliver(
                     )
                     
                     # Wait for the specified delay (checking for shutdown periodically)
-                    # delay_seconds = RETRY_DELAY_MINUTES * 60
-                    delay_seconds = 10
+                    delay_seconds = RETRY_DELAY_MINUTES * 60
+                    # delay_seconds = 10
                     elapsed = 0
                     check_interval = 10  # Check every 10 seconds
                     while elapsed < delay_seconds and not _shutdown:

@@ -10,10 +10,20 @@ A notification engine for a Fintech platform: when a payment occurs, the system 
 |-------------|----------------|
 | **Ingestion API** | `POST /events` accepts payment payloads (Flask API behind nginx). |
 | **Kafka Cluster** | 3-broker KRaft-mode cluster providing durable message queueing with replication factor 3. |
-| **Dispatcher worker** | Consumes from Kafka and asynchronously delivers payloads to a configurable webhook URL with retries and backoff. |
+| **Dispatcher worker** | Consumes from Kafka and asynchronously delivers payloads to merchant server with retries and backoff. |
 | **Merchant server (Mock receiver)** | Merchant-server simulates a chaotic destination (configurable failure rate, timeouts) to validate the dispatcher. |
 | **Transactional Outbox** | Postgres-based outbox pattern ensuring no message loss even if Kafka is down or service crashes. |
 | **Outbox Publisher** | Background worker polling `outbox_events` table and publishing pending events to Kafka. |
+
+**Constraints addressed:**
+
+- **atleast-once-delivery** -- high durability is achieved in kafka cluster with 3 partitions replicated across 3 brokers, adding redundancy ensures no message is lost. 
+  - Transactional outbox is implemented to ensure messages are not lost in case of service failure. 
+  - 3 instances of the ingestion api are spun up for high availability during peak loads, to ensure all payment events are received. nginx is used to load balance.
+- **No message loss on process kill** – Events are written to Postgres (payments + transactional outbox). Outbox publisher and Kafka provide durable queueing; dispatcher consumes from Kafka. Restart resumes processing.
+- **No thundering herd** – Binary exponential backoff on delivery retries (e.g. 2s, 4s, 8s); failed webhooks re-queued to Kafka and consumer paused before retry window. This ensures no heavy load is put on merchant server during traffic spikes.
+- **Receiver verification** – Webhook requests include `X-HMAC-Signature` (HMAC-SHA256 over payload); merchant can verify requests are from this system.
+
 
 ### Kafka Cluster
 
@@ -99,14 +109,6 @@ A background worker that polls the `outbox_events` table and publishes pending e
 - `KAFKA_BOOTSTRAP_SERVERS`: Kafka broker addresses
 - `KAFKA_TOPIC`: Target topic name (`payment-webhooks`)
 
-**Constraints addressed:**
-
-- **atleast-once-delivery** -- high durability is achieved in kafka cluster with 3 partitions replicated across 3 brokers, adding redundancy ensures no message is lost. 
-  - Transactional outbox is implemented to ensure messages are not lost in case of service failure. 
-  - 3 instances of the ingestion api are spun up for high availability during peak loads, to ensure all payment events are received. nginx is used to load balance.
-- **No message loss on process kill** – Events are written to Postgres (payments + transactional outbox). Outbox publisher and Kafka provide durable queueing; dispatcher consumes from Kafka. Restart resumes processing.
-- **No thundering herd** – Binary exponential backoff on delivery retries (e.g. 2s, 4s, 8s); failed webhooks re-queued to Kafka and consumer paused before retry window. This ensures no heavy load is put on merchant server during traffic spikes.
-- **Receiver verification** – Webhook requests include `X-HMAC-Signature` (HMAC-SHA256 over payload); merchant can verify requests are from this system.
 
 ---
 
@@ -166,31 +168,9 @@ A background worker that polls the `outbox_events` table and publishes pending e
    uv run python scripts/client.py --url http://localhost:8000 --max 20
    ```
 
-
+4. Track merchant-server container logs, log dump confirms all 20 events are received
 ---
 
-## Submission / Verification
-
-- **Deliverable: Docker Compose** – Run the system with:
-
-  ```bash
-  docker-compose up
-  ```
-
-- **Deliverable: At-least-once and backoff** – In logs you should see:
-  - A message failing several times with increasing delays (e.g. 2s, 4s, 8s).
-  - Backoff and then either success or re-queue + consumer pause and retry later.
-
-  Example log pattern:
-
-  ```
-  Retrying webhook delivery tid=... attempt=2/3 after 2.0s backoff (exponential)
-  Retrying webhook delivery tid=... attempt=3/3 after 4.0s backoff (exponential)
-  ✗ WEBHOOK DELIVERY FAILED PERMANENTLY ... RE-QUEUING AND PAUSING CONSUMER
-  Consumer paused ... Waiting 5 minutes before resuming
-  ```
-
----
 
 ## Configuration
 
@@ -200,8 +180,10 @@ A background worker that polls the `outbox_events` table and publishes pending e
 | API | `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC` | Kafka connection; if unavailable, only DB/outbox is written. |
 | Dispatcher | `WEBHOOK_URL` | Target webhook URL (default: merchant-server). |
 | Dispatcher | `HMAC_SECRET` | Used to sign webhook body (`X-HMAC-Signature`). |
+| Dispatcher | `RETRY_DELAY_MINUTES` | When merchant server goes unresponsive, time to sleep before trying again |
 | Merchant-server | `FAILURE_RATE` | e.g. `0.7` = 70% of requests fail (default). |
 | Outbox publisher | `OUTBOX_POLL_INTERVAL_SEC`, `OUTBOX_BATCH_SIZE` | Poll and batch size. |
+
 
 ---
 
@@ -217,28 +199,6 @@ If Kafka is down, the API still returns 201 after writing to Postgres/outbox; th
 
 ---
 
-## Running Locally (without Docker)
-
-1. **Postgres & Kafka** – Run them (e.g. via Docker or host install). Create DB and run `scripts/init.sql` if using Postgres.
-
-2. **Environment** – `.env` with `HMAC_SECRET`, `POSTGRES_*`, `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, etc.
-
-3. **Install**
-
-   ```bash
-   uv sync
-   # or: pip install -e .
-   ```
-
-4. **Endpoints**
-
-   - Ingestion API: `python ingestion-api/main.py` (default port 5000).
-   - Client: `python scripts/client.py --url http://localhost:5000` (use same `HMAC_SECRET`).
-   - Dispatcher: `python dispatcher/worker.py`.
-   - Outbox publisher: `python outbox/publisher.py`.
-   - Merchant-server: `python merchant-server/main.py` (e.g. port 5001).
-
----
 
 ## Project Structure
 
