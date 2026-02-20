@@ -4,7 +4,7 @@ services:
   flask-api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ingestion-api/Dockerfile
     deploy:
       replicas: 3
     environment:
@@ -46,6 +46,22 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    networks:
+      - bruce-network
+
+  merchant-server:
+    build:
+      context: .
+      dockerfile: merchant-server/Dockerfile
+    container_name: bruce-merchant-server
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - RESPONSE_TIMEOUT=${RESPONSE_TIMEOUT:-5}
+      - FAILURE_RATE=${FAILURE_RATE:-0.7}
+    env_file:
+      - .env
     networks:
       - bruce-network
 
@@ -139,6 +155,24 @@ services:
     networks:
       - bruce-network
   
+  dispatcher:
+    build:
+      context: .
+      dockerfile: dispatcher/Dockerfile
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka1:9092,kafka2:9092,kafka3:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-payment-webhooks}
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://merchant-server:5001/webhook_listener}
+      - HMAC_SECRET=${HMAC_SECRET:-your-secret-key-here-change-this-in-production}
+    env_file:
+      - .env
+    depends_on:
+      kafka1:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - bruce-network
+
   init-kafka:
     image: apache/kafka:latest
     container_name: init-kafka
