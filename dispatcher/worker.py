@@ -17,8 +17,9 @@ from dotenv import load_dotenv
 
 load_dotenv(".env.local")
 load_dotenv()
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(
@@ -30,12 +31,56 @@ logger = logging.getLogger(__name__)
 
 # Defaults (override via env)
 DEFAULT_TOPIC = "payment-webhooks"
+DEFAULT_DLQ_TOPIC = "payment-webhooks-dlq"
 DEFAULT_GROUP_ID = "webhook-dispatcher"
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 2
 REQUEST_TIMEOUT_SEC = 3
 
 _shutdown = False
+_producer: Optional[KafkaProducer] = None
+
+
+def _get_producer(bootstrap_servers: list[str]) -> KafkaProducer:
+    """Get or create Kafka producer for sending messages to DLQ."""
+    global _producer
+    if _producer is None:
+        _producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+            key_serializer=lambda k: k.encode("utf-8") if k else None,
+            acks="all",
+            retries=5,
+            metadata_max_age_ms=300000,
+        )
+    return _producer
+
+
+def _send_to_dlq(
+    producer: KafkaProducer,
+    dlq_topic: str,
+    payload: dict,
+    original_attempts: int,
+) -> None:
+    """Send failed webhook to dead letter queue with metadata."""
+    dlq_message = {
+        "payload": payload,
+        "metadata": {
+            "failed_at": time.time(),
+            "original_attempts": original_attempts,
+            "transaction_id": payload.get("Transaction ID", "?"),
+        },
+    }
+    try:
+        future = producer.send(dlq_topic, value=dlq_message)
+        future.get(timeout=10)  # Wait for send to complete
+        logger.info(
+            "Sent failed webhook to DLQ tid=%s attempts=%d",
+            payload.get("Transaction ID", "?"),
+            original_attempts,
+        )
+    except Exception as e:
+        logger.error("Failed to send message to DLQ: %s", e)
 
 
 def _generate_signature(payload: dict, secret: str) -> str:
@@ -74,12 +119,6 @@ def _deliver_to_webhook(webhook_url: str, payload: dict, hmac_secret: str) -> bo
         )
         return True
     except requests.RequestException as e:
-        # logger.warning(
-        #     "✗ WEBHOOK DELIVERY FAILED tid=%s url=%s error=%s",
-        #     transaction_id,
-        #     webhook_url,
-        #     str(e),
-        # )
         return False
 
 
@@ -87,6 +126,8 @@ def _consume_and_deliver(
     consumer: KafkaConsumer,
     webhook_url: str,
     hmac_secret: str,
+    dlq_topic: str,
+    producer: KafkaProducer,
 ) -> None:
     global _shutdown
     for message in consumer:
@@ -125,18 +166,21 @@ def _consume_and_deliver(
         
         if not delivered:
             logger.error(
-                "✗ WEBHOOK DELIVERY FAILED PERMANENTLY tid=%s url=%s attempts=%d - NO MORE RETRIES",
+                "✗ WEBHOOK DELIVERY FAILED PERMANENTLY tid=%s url=%s attempts=%d - SENDING TO DLQ",
                 transaction_id,
                 webhook_url,
                 MAX_RETRIES,
             )
+            _send_to_dlq(producer, dlq_topic, payload, MAX_RETRIES)
 
 
 def main() -> None:
     global _shutdown
 
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    bootstrap_list = [b.strip() for b in bootstrap.split(",") if b.strip()]
     topic = os.getenv("KAFKA_TOPIC", DEFAULT_TOPIC)
+    dlq_topic = os.getenv("KAFKA_DLQ_TOPIC", DEFAULT_DLQ_TOPIC)
     group_id = os.getenv("KAFKA_CONSUMER_GROUP", DEFAULT_GROUP_ID)
     webhook_url = os.getenv("WEBHOOK_URL")
     hmac_secret = os.getenv("HMAC_SECRET")
@@ -156,17 +200,25 @@ def main() -> None:
     signal.signal(signal.SIGINT, on_signal)
 
     logger.info(
-        "Starting worker bootstrap=%s topic=%s group=%s webhook=%s",
+        "Starting worker bootstrap=%s topic=%s dlq_topic=%s group=%s webhook=%s",
         bootstrap,
         topic,
+        dlq_topic,
         group_id,
         webhook_url,
     )
 
+    # Initialize producer for DLQ
+    try:
+        producer = _get_producer(bootstrap_list)
+    except Exception as e:
+        logger.error("Failed to create Kafka producer: %s", e)
+        sys.exit(1)
+
     try:
         consumer = KafkaConsumer(
             topic,
-            bootstrap_servers=bootstrap.split(","),
+            bootstrap_servers=bootstrap_list,
             group_id=group_id,
             auto_offset_reset="earliest",
             enable_auto_commit=True,
@@ -177,9 +229,11 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        _consume_and_deliver(consumer, webhook_url, hmac_secret)
+        _consume_and_deliver(consumer, webhook_url, hmac_secret, dlq_topic, producer)
     finally:
         consumer.close()
+        if _producer:
+            _producer.close()
         logger.info("Worker stopped.")
 
 
