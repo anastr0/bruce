@@ -49,25 +49,34 @@ def _get_producer(bootstrap_servers: list[str]) -> KafkaProducer:
             bootstrap_servers=bootstrap_servers,
             value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
             key_serializer=lambda k: k.encode("utf-8") if k else None,
-            acks="all",
-            retries=5,
+            acks=1,
+            retries=3,
+            max_block_ms=500,
+            reconnect_backoff_ms=5000,
+            request_timeout_ms=1000,
             metadata_max_age_ms=300000,
         )
     return _producer
 
 
 def _requeue_webhook(
-    producer: KafkaProducer,
+    producer: Optional[KafkaProducer],
     topic: str,
     payload: dict,
+    transaction_id: str,
 ) -> None:
     """Re-queue failed webhook back to Kafka topic."""
+    if producer is None:
+        logger.warning("Cannot re-queue webhook - Kafka producer unavailable")
+        return
     try:
-        future = producer.send(topic, value=payload)
+        logger.info(f"\n\nRe-queuing failed webhook to Kafka topic: {topic}")
+        logger.info(f"Payload: {payload}\n\n")
+        future = producer.send(topic, value=payload, key=transaction_id)
         future.get(timeout=10)  # Wait for send to complete
         logger.info(
             "Re-queued failed webhook to Kafka tid=%s topic=%s",
-            payload.get("Transaction ID", "?"),
+            transaction_id,
             topic,
         )
     except Exception as e:
@@ -165,8 +174,14 @@ def _consume_and_deliver(
                 MAX_RETRIES,
             )
             
-            # Re-queue the failed webhook back to Kafka
-            _requeue_webhook(producer, topic, payload)
+            # Re-queue the failed webhook back to Kafka (if producer is available)
+            if producer is not None:
+                try:
+                    _requeue_webhook(producer, topic, payload, transaction_id)
+                except Exception as e:
+                    logger.error("Failed to re-queue webhook to Kafka (Kafka unavailable): %s", e)
+            else:
+                logger.warning("Cannot re-queue webhook - Kafka producer unavailable")
             
             # Pause consumer to stop processing new messages
             try:
@@ -249,32 +264,57 @@ def main() -> None:
         RETRY_DELAY_MINUTES,
     )
 
-    # Initialize producer for re-queuing messages
+    # Initialize producer for re-queuing messages (may fail if Kafka is down, that's ok)
+    producer = None
     try:
         producer = _get_producer(bootstrap_list)
     except Exception as e:
-        logger.error("Failed to create Kafka producer: %s", e)
-        sys.exit(1)
+        logger.error("Failed to create Kafka producer (will retry)")
+        # Don't exit, continue without producer - will retry later
 
-    try:
-        consumer = KafkaConsumer(
-            topic,
-            bootstrap_servers=bootstrap_list,
-            group_id=group_id,
-            auto_offset_reset="earliest",
-            enable_auto_commit=True,
-            value_deserializer=lambda v: v,
-        )
-    except KafkaError as e:
-        logger.error("Failed to create Kafka consumer: %s", e)
+    # Initialize consumer (may fail if Kafka is down, retry in loop)
+    consumer = None
+    retry_interval = 30  # Retry every 30 seconds if Kafka is unavailable
+    
+    while consumer is None and not _shutdown:
+        try:
+            consumer = KafkaConsumer(
+                topic,
+                bootstrap_servers=bootstrap_list,
+                group_id=group_id,
+                auto_offset_reset="earliest",
+                enable_auto_commit=True,
+                value_deserializer=lambda v: v,
+            )
+            logger.info("Kafka consumer connected successfully")
+        except KafkaError as e:
+            logger.error("Kafka brokers unavailable, retrying in %d seconds: %s", retry_interval, e)
+            if not _shutdown:
+                time.sleep(retry_interval)
+    
+    if _shutdown:
+        logger.info("Shutdown requested before Kafka connection established")
+        return
+    
+    if consumer is None:
+        logger.error("Failed to create Kafka consumer after retries")
         sys.exit(1)
 
     try:
         _consume_and_deliver(consumer, webhook_url, hmac_secret, topic, producer)
+    except Exception as e:
+        logger.error("Error in consume loop: %s", e)
     finally:
-        consumer.close()
+        if consumer:
+            try:
+                consumer.close()
+            except Exception:
+                pass
         if _producer:
-            _producer.close()
+            try:
+                _producer.close()
+            except Exception:
+                pass
         logger.info("Worker stopped.")
 
 

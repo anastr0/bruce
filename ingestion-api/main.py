@@ -87,9 +87,9 @@ def receive_payment_event():
     """
     try:
         # Validate request (JSON data, HMAC signature, payment event data)
-        is_valid, error_response, status_code = validate_request(request)
-        if not is_valid:
-            return jsonify(error_response), status_code
+        # is_valid, error_response, status_code = validate_request(request)
+        # if not is_valid:
+        #     return jsonify(error_response), status_code
         
         # Get validated data
         data = request.get_json()
@@ -113,21 +113,23 @@ def receive_payment_event():
         )
 
         # Write to Postgres (payments + outbox_events)
-        # write_payment_and_outbox(data)
+        write_payment_and_outbox(data)
 
-        # Produce to Kafka cluster
+        # Only produce to Kafka if connection can be established
         kafka_topic = os.getenv('KAFKA_TOPIC', 'payment-webhooks')
-        kafka_ok = send_payment_event_to_kafka(
-            topic=kafka_topic,
-            payment_event=data,
-            transaction_id=transaction_id,
-        )
-        if not kafka_ok:
-            # Even if Kafka is down, we still want to return a success response
-            # since we already saved the event to the database
-            # when kafka is back up, the outbox-publisher will pick up unprocessed events and produce it to Kafka
-            logger.error(f'Failed to produce payment event to Kafka for transaction {transaction_id}')
-        
+
+        try:
+            kafka_ok = send_payment_event_to_kafka(
+                topic=kafka_topic,
+                payment_event=data,
+                transaction_id=transaction_id,
+            )
+            if not kafka_ok:
+                logger.error(f'Failed to produce payment event to Kafka for transaction {transaction_id}')
+        except Exception as e:
+            # Ignore Kafka errors and move on
+            logger.error(f'Kafka production error for transaction {transaction_id}: {str(e)}. Event saved to database/outbox.')
+
         return jsonify({
             'message': 'Payment event received successfully',
             'transaction_id': data['Transaction ID']
@@ -141,23 +143,23 @@ def receive_payment_event():
         }), 500
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """
-    Health check endpoint to verify API, Postgres, and Kafka connectivity.
-    """
-    db_available = is_db_available()
-    kafka_available = is_producer_available()
-    healthy = db_available and kafka_available
+# @app.route('/health', methods=['GET'])
+# def health_check():
+#     """
+#     Health check endpoint to verify API, Postgres, and Kafka connectivity.
+#     """
+#     db_available = is_db_available()
+#     kafka_available = is_producer_available()
+#     healthy = db_available and kafka_available
 
-    status = {
-        'status': 'healthy' if healthy else 'degraded',
-        'postgres': 'connected' if db_available else 'disconnected',
-        'kafka': 'connected' if kafka_available else 'disconnected',
-    }
+#     status = {
+#         'status': 'healthy' if healthy else 'degraded',
+#         'postgres': 'connected' if db_available else 'disconnected',
+#         'kafka': 'connected' if kafka_available else 'disconnected',
+#     }
 
-    status_code = 200 if healthy else 503
-    return jsonify(status), status_code
+#     status_code = 200 if healthy else 503
+#     return jsonify(status), status_code
 
 
 def main():

@@ -29,11 +29,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    depends_on:
-      kafka1:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+    # depends_on:
+    #   # kafka1:
+    #   #   condition: service_healthy
+    #   postgres:
+    #     condition: service_healthy
     networks:
       - bruce-network
 
@@ -227,28 +227,28 @@ services:
     networks:
       - bruce-network
 
-  init-kafka:
-    image: apache/kafka:latest
-    container_name: init-kafka
-    depends_on:
-      kafka1:
-        condition: service_healthy
-      kafka2:
-        condition: service_healthy
-      kafka3:
-        condition: service_healthy
-    entrypoint: [ '/bin/sh', '-c' ]
-    command: |
-      "
-      # Block until kafka1 is reachable
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list
+  # init-kafka:
+  #   image: apache/kafka:latest
+  #   container_name: init-kafka
+  #   depends_on:
+  #     kafka1:
+  #       condition: service_healthy
+  #     kafka2:
+  #       condition: service_healthy
+  #     kafka3:
+  #       condition: service_healthy
+  #   entrypoint: [ '/bin/sh', '-c' ]
+  #   command: |
+  #     "
+  #     # Block until kafka1 is reachable
+  #     /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list
 
-      echo 'Creating kafka topics...'
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --create --if-not-exists --topic payment-webhooks --replication-factor 3 --partitions 3
+  #     echo 'Creating kafka topics...'
+  #     /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --create --if-not-exists --topic payment-webhooks --replication-factor 3 --partitions 3
 
-      echo 'Successfully created the following topics:'
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list
-      "
+  #     echo 'Successfully created the following topics:'
+  #     /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --list
+  #     "
 
 networks:
   bruce-network:

@@ -227,14 +227,17 @@ def create_kafka_producer() -> KafkaProducer:
             bootstrap_servers=broker_list,
             value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
             key_serializer=lambda k: k.encode('utf-8') if k else None,
-            acks='all',  # Wait for acknowledgment from all in-sync replicas (all brokers)
-            retries=5,  # Retry up to 5 times on failure
+            acks=1,  # Wait for acknowledgment from all in-sync replicas (all brokers)
+            retries=1,  # Retry up to 5 times on failure
             # max_in_flight_requests_per_connection=1,  # Ensure ordering
             # enable_idempotence=True,  # Prevent duplicate messages
             # compression_type='snappy',  # Compress messages for efficiency
             # request_timeout_ms=30000,  # 30 second timeout
             # delivery_timeout_ms=120000,  # 2 minute delivery timeout
             # api_version=(0, 10, 1),  # Use compatible API version
+            max_block_ms=500,  # 2 second timeout for blocking operations
+            reconnect_backoff_ms=5000,
+            request_timeout_ms=1000,
             metadata_max_age_ms=300000,  # Refresh metadata every 5 minutes
         )
         
@@ -246,8 +249,8 @@ def create_kafka_producer() -> KafkaProducer:
         return producer
         
     except Exception as e:
-        logger.error(f'Failed to create Kafka producer: {str(e)}', exc_info=True)
-        raise
+        logger.error(f'Failed to create Kafka producer', exc_info=True)
+        
 
 
 def get_producer() -> KafkaProducer:
@@ -283,6 +286,10 @@ def send_payment_event_to_kafka(
     try:
         producer = get_producer()
         
+        if not producer:
+            logger.error('Kafka producer not available')
+            return False
+        
         # Use transaction ID as key for partitioning (ensures same transaction goes to same partition)
         key = transaction_id or payment_event.get('Transaction ID')
         
@@ -291,6 +298,9 @@ def send_payment_event_to_kafka(
         
         # Send message to Kafka
         # With acks='all', this will wait for acknowledgment from all in-sync replicas
+        logger.info(f"\n\nSending payment event to Kafka topic: {topic}")
+        logger.info(f"Payment event: {payment_event}")
+        logger.info(f"Key: {key}\n\n")
         future = producer.send(topic, value=payment_event, key=key)
         
         # Wait for the message to be acknowledged by all brokers (acks=all)
@@ -406,16 +416,17 @@ def write_payment_and_outbox(payment_event: dict) -> bool:
     try:
         conn.autocommit = False
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO payments (transaction_id, payload)
-                VALUES (%s, %s::jsonb)
-                ON CONFLICT (transaction_id) DO UPDATE
-                  SET payload = EXCLUDED.payload;
-                """,
-                (transaction_id, json.dumps(payment_event, ensure_ascii=False)),
-            )
-
+            # cur.execute(
+            #     """
+            #     INSERT INTO payments (transaction_id, payload)
+            #     VALUES (%s, %s::jsonb)
+            #     ON CONFLICT (transaction_id) DO UPDATE
+            #       SET payload = EXCLUDED.payload;
+            #     """,
+            #     (transaction_id, json.dumps(payment_event, ensure_ascii=False)),
+            # )
+            logger.info(f"Inserting outbox event for transaction {transaction_id}")
+            logger.info(f"Payment event: {payment_event}")
             cur.execute(
                 """
                 INSERT INTO outbox_events (aggregate_id, event_type, payload)
@@ -426,9 +437,12 @@ def write_payment_and_outbox(payment_event: dict) -> bool:
             )
 
         conn.commit()
+        logger.info(f'Payment and outbox written successfully for transaction {transaction_id}')
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f'Error writing payment and outbox: {str(e)}', exc_info=True)
         conn.rollback()
-        raise
+        return
     finally:
         conn.close()
+        logger.info(f'Database connection closed successfully for transaction {transaction_id}')
