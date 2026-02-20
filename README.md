@@ -1,4 +1,4 @@
-# Bruce – Webhook Dispatcher (At-Least-Once Delivery)
+# Bruce
 
 A notification engine for a Fintech platform: when a payment occurs, the system sends an HTTP webhook to a merchant’s server with **at-least-once delivery** guarantees, even when the merchant server is unreliable (timeouts, 500s, long outages).
 
