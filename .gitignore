@@ -3,3 +3,7 @@
 .env
 *.pyc
 __pycache__
+
+
+# developer files
+notes.md

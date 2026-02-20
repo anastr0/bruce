@@ -111,7 +111,7 @@ def receive_payment_event():
         )
         
         # Send payment event to Kafka
-        kafka_topic = os.getenv('KAFKA_TOPIC', 'payment-events')
+        kafka_topic = os.getenv('KAFKA_TOPIC', 'payment-webhooks')
         kafka_success = send_payment_event_to_kafka(
             topic=kafka_topic,
             payment_event=data,
