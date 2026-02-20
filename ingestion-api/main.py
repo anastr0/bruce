@@ -3,7 +3,9 @@ from utils import (
     validate_payment_event,
     verify_signature,
     get_hmac_secret,
+    write_payment_and_outbox,
     send_payment_event_to_kafka,
+    is_db_available,
     is_producer_available,
 )
 import logging
@@ -109,23 +111,23 @@ def receive_payment_event():
             f'Receiver: {receiver}, '
             f'Timestamp: {timestamp}'
         )
-        
-        # Send payment event to Kafka
+
+        # Write to Postgres (payments + outbox_events)
+        # write_payment_and_outbox(data)
+
+        # Produce to Kafka cluster
         kafka_topic = os.getenv('KAFKA_TOPIC', 'payment-webhooks')
-        kafka_success = send_payment_event_to_kafka(
+        kafka_ok = send_payment_event_to_kafka(
             topic=kafka_topic,
             payment_event=data,
-            transaction_id=transaction_id
+            transaction_id=transaction_id,
         )
+        if not kafka_ok:
+            # Even if Kafka is down, we still want to return a success response
+            # since we already saved the event to the database
+            # when kafka is back up, the outbox-publisher will pick up unprocessed events and produce it to Kafka
+            logger.error(f'Failed to produce payment event to Kafka for transaction {transaction_id}')
         
-        if not kafka_success:
-            logger.error(f'Failed to send payment event to Kafka for transaction {transaction_id}')
-            return jsonify({
-                'error': 'Internal server error',
-                'message': 'Internal server error'
-            }), 500
-        
-        # Return success response
         return jsonify({
             'message': 'Payment event received successfully',
             'transaction_id': data['Transaction ID']
@@ -142,16 +144,19 @@ def receive_payment_event():
 @app.route('/health', methods=['GET'])
 def health_check():
     """
-    Health check endpoint to verify API and Kafka connectivity.
+    Health check endpoint to verify API, Postgres, and Kafka connectivity.
     """
+    db_available = is_db_available()
     kafka_available = is_producer_available()
-    
+    healthy = db_available and kafka_available
+
     status = {
-        'status': 'healthy' if kafka_available else 'degraded',
-        'kafka': 'connected' if kafka_available else 'disconnected'
+        'status': 'healthy' if healthy else 'degraded',
+        'postgres': 'connected' if db_available else 'disconnected',
+        'kafka': 'connected' if kafka_available else 'disconnected',
     }
-    
-    status_code = 200 if kafka_available else 503
+
+    status_code = 200 if healthy else 503
     return jsonify(status), status_code
 
 

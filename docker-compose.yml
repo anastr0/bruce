@@ -12,6 +12,11 @@ services:
       # Override KAFKA_BOOTSTRAP_SERVERS for Docker network (use internal Docker service names)
       - KAFKA_BOOTSTRAP_SERVERS=kafka1:9092,kafka2:9092,kafka3:9092
       - KAFKA_TOPIC=${KAFKA_TOPIC:-payment-webhooks}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-bruce}
+      - POSTGRES_USER=${POSTGRES_USER:-bruce}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bruce}
     env_file:
       - .env
     volumes:
@@ -26,6 +31,8 @@ services:
       start_period: 40s
     depends_on:
       kafka1:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     networks:
       - bruce-network
@@ -62,6 +69,27 @@ services:
       - FAILURE_RATE=${FAILURE_RATE:-0.7}
     env_file:
       - .env
+    networks:
+      - bruce-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bruce-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-bruce}
+      - POSTGRES_USER=${POSTGRES_USER:-bruce}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bruce}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bruce} -d ${POSTGRES_DB:-bruce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - bruce-network
 
@@ -173,6 +201,32 @@ services:
     networks:
       - bruce-network
 
+  outbox-publisher:
+    build:
+      context: .
+      dockerfile: outbox/Dockerfile
+    container_name: bruce-outbox-publisher
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka1:9092,kafka2:9092,kafka3:9092
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-payment-webhooks}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-bruce}
+      - POSTGRES_USER=${POSTGRES_USER:-bruce}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bruce}
+      - OUTBOX_POLL_INTERVAL_SEC=${OUTBOX_POLL_INTERVAL_SEC:-1}
+      - OUTBOX_BATCH_SIZE=${OUTBOX_BATCH_SIZE:-25}
+    env_file:
+      - .env
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - bruce-network
+
   init-kafka:
     image: apache/kafka:latest
     container_name: init-kafka
@@ -205,3 +259,4 @@ volumes:
   kafka1-data:
   kafka2-data:
   kafka3-data:
+  postgres-data:

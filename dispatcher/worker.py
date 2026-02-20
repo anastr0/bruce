@@ -33,7 +33,7 @@ DEFAULT_TOPIC = "payment-webhooks"
 DEFAULT_GROUP_ID = "webhook-dispatcher"
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 2
-REQUEST_TIMEOUT_SEC = 30
+REQUEST_TIMEOUT_SEC = 3
 
 _shutdown = False
 
@@ -52,6 +52,7 @@ def _generate_signature(payload: dict, secret: str) -> str:
 
 def _deliver_to_webhook(webhook_url: str, payload: dict, hmac_secret: str) -> bool:
     """POST payload to webhook URL with X-HMAC-Signature header. Returns True on success."""
+    transaction_id = payload.get("Transaction ID", "?")
     signature = _generate_signature(payload, hmac_secret)
     headers = {
         "Content-Type": "application/json",
@@ -66,13 +67,19 @@ def _deliver_to_webhook(webhook_url: str, payload: dict, hmac_secret: str) -> bo
         )
         resp.raise_for_status()
         logger.info(
-            "Delivered to webhook tid=%s status=%s",
-            payload.get("Transaction ID", "?"),
+            "✓ WEBHOOK DELIVERED SUCCESSFULLY tid=%s url=%s status=%s",
+            transaction_id,
+            webhook_url,
             resp.status_code,
         )
         return True
     except requests.RequestException as e:
-        logger.warning("Webhook delivery failed: %s", e)
+        # logger.warning(
+        #     "✗ WEBHOOK DELIVERY FAILED tid=%s url=%s error=%s",
+        #     transaction_id,
+        #     webhook_url,
+        #     str(e),
+        # )
         return False
 
 
@@ -90,18 +97,38 @@ def _consume_and_deliver(
         except (json.JSONDecodeError, AttributeError) as e:
             logger.error("Invalid message (skip): %s", e)
             continue
+        
+        transaction_id = payload.get("Transaction ID", "?")
+        logger.info("Processing webhook delivery tid=%s", transaction_id)
+        
         delivered = False
         for attempt in range(1, MAX_RETRIES + 1):
             if _deliver_to_webhook(webhook_url, payload, hmac_secret):
                 delivered = True
+                logger.info(
+                    "✓ WEBHOOK DELIVERY COMPLETED tid=%s attempts=%d/%d",
+                    transaction_id,
+                    attempt,
+                    MAX_RETRIES,
+                )
                 break
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SEC * attempt)
+                backoff_delay = RETRY_BACKOFF_SEC * attempt
+                logger.info(
+                    "Retrying webhook delivery tid=%s attempt=%d/%d after %.1fs backoff",
+                    transaction_id,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    backoff_delay,
+                )
+                time.sleep(backoff_delay)
+        
         if not delivered:
             logger.error(
-                "Failed to deliver after %d attempts, tid=%s",
+                "✗ WEBHOOK DELIVERY FAILED PERMANENTLY tid=%s url=%s attempts=%d - NO MORE RETRIES",
+                transaction_id,
+                webhook_url,
                 MAX_RETRIES,
-                payload.get("Transaction ID", "?"),
             )
 
 

@@ -8,6 +8,8 @@ import logging
 import atexit
 from typing import Optional
 from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
 from kafka import KafkaProducer
 from kafka.errors import KafkaError, KafkaTimeoutError, LeaderNotAvailableError
 
@@ -359,3 +361,74 @@ def is_producer_available() -> bool:
     except Exception as e:
         logger.warning(f'Kafka producer not available: {str(e)}')
         return False
+
+
+# ============================================================================
+# Postgres Transactional Outbox
+# ============================================================================
+
+def _get_db_conn():
+    dsn = os.getenv("DATABASE_URL")
+    if dsn:
+        return psycopg2.connect(dsn)
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "postgres"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        dbname=os.getenv("POSTGRES_DB", "bruce"),
+        user=os.getenv("POSTGRES_USER", "bruce"),
+        password=os.getenv("POSTGRES_PASSWORD", "bruce"),
+    )
+
+
+def is_db_available() -> bool:
+    try:
+        conn = _get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"Postgres not available: {str(e)}")
+        return False
+
+
+def write_payment_and_outbox(payment_event: dict) -> bool:
+    """
+    Transactionally write the payment event to `payments` and enqueue an outbox row.
+    This replaces publishing directly to Kafka in the request path.
+    """
+    transaction_id = payment_event.get("Transaction ID")
+    if not transaction_id:
+        raise ValueError("Transaction ID missing from payment event")
+
+    conn = _get_db_conn()
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO payments (transaction_id, payload)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (transaction_id) DO UPDATE
+                  SET payload = EXCLUDED.payload;
+                """,
+                (transaction_id, json.dumps(payment_event, ensure_ascii=False)),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO outbox_events (aggregate_id, event_type, payload)
+                VALUES (%s, %s, %s::jsonb)
+                ON CONFLICT (aggregate_id, event_type) DO NOTHING;
+                """,
+                (transaction_id, "payment.received", json.dumps(payment_event, ensure_ascii=False)),
+            )
+
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

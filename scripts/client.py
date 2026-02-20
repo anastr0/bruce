@@ -126,6 +126,7 @@ def send_payment_event(api_url: str, transaction: Dict[str, Any], hmac_secret: s
         )
         
         if response.status_code == 201:
+            print(f"Event payload sent: {transaction}")
             return True, f"Success: {response.json().get('message', 'Event received')}"
         else:
             error_msg = response.json().get('error', 'Unknown error')
