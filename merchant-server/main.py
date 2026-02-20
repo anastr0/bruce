@@ -52,7 +52,7 @@ def receive_webhook():
     # Success: respond within timeout
     logger.info("Accepted webhook tid=%s", tid)
     accepted_transactions.add(tid)
-    logger.info("Accepted transactions so far :-")
+    logger.info(f"Accepted transactions so far :-{len(accepted_transactions)}")
     logger.info(accepted_transactions)
     return jsonify({"status": "accepted", "transaction_id": tid}), 200
 
