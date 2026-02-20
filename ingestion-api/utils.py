@@ -229,13 +229,7 @@ def create_kafka_producer() -> KafkaProducer:
             key_serializer=lambda k: k.encode('utf-8') if k else None,
             acks=1,  # Wait for acknowledgment from all in-sync replicas (all brokers)
             retries=1,  # Retry up to 5 times on failure
-            # max_in_flight_requests_per_connection=1,  # Ensure ordering
-            # enable_idempotence=True,  # Prevent duplicate messages
-            # compression_type='snappy',  # Compress messages for efficiency
-            # request_timeout_ms=30000,  # 30 second timeout
-            # delivery_timeout_ms=120000,  # 2 minute delivery timeout
-            # api_version=(0, 10, 1),  # Use compatible API version
-            max_block_ms=500,  # 2 second timeout for blocking operations
+            max_block_ms=100,  # 2 second timeout for blocking operations
             reconnect_backoff_ms=5000,
             request_timeout_ms=1000,
             metadata_max_age_ms=300000,  # Refresh metadata every 5 minutes
